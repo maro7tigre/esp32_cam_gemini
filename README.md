@@ -1,4 +1,4 @@
-```md
+
 # Setup Instructions
 
 This project requires that you install the [ArduinoJson](https://github.com/bblanchon/ArduinoJson) library and create a separate credentials file to store sensitive data (such as your WiFi credentials and Gemini API key). Follow the steps below:
