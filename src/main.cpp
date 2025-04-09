@@ -37,6 +37,7 @@ const String PROMPT = "I want a short answer for which trash type do you see in 
 int photoCounter = 1;
 String currentPhotoFilePath = "";
 String geminiReply = "";  // Variable to store Gemini's reply
+String base64Image = "";  // Variable to store the base64 encoded image
 
 // Create a web server on port 80
 WebServer server(80);
@@ -45,6 +46,33 @@ WebServer server(80);
 uint8_t* lastImageBuffer = NULL;
 size_t lastImageSize = 0;
 bool newImageAvailable = false;
+
+// Default camera resolution (can be changed via serial input)
+framesize_t currentResolution = FRAMESIZE_SVGA; // Default resolution
+
+// Resolution mapping based on numeric input (1-8)
+framesize_t resolutionMap[] = {
+  FRAMESIZE_QQVGA,   // 1: 160x120
+  FRAMESIZE_QVGA,    // 2: 320x240
+  FRAMESIZE_CIF,     // 3: 400x296
+  FRAMESIZE_VGA,     // 4: 640x480
+  FRAMESIZE_SVGA,    // 5: 800x600
+  FRAMESIZE_XGA,     // 6: 1024x768
+  FRAMESIZE_SXGA,    // 7: 1280x1024
+  FRAMESIZE_UXGA     // 8: 1600x1200
+};
+
+// Resolution names for diagnostic output
+const char* resolutionNames[] = {
+  "QQVGA (160x120)",
+  "QVGA (320x240)",
+  "CIF (400x296)",
+  "VGA (640x480)",
+  "SVGA (800x600)",
+  "XGA (1024x768)",
+  "SXGA (1280x1024)",
+  "UXGA (1600x1200)"
+};
 
 // Flush the camera buffer by capturing and discarding one frame
 void flushCameraBuffer() {
@@ -55,8 +83,8 @@ void flushCameraBuffer() {
   }
 }
 
-// Initialize the camera with lower resolution for memory efficiency
-bool initCamera() {
+// Initialize the camera with specified resolution
+bool initCamera(framesize_t resolution = FRAMESIZE_SVGA) {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -100,7 +128,7 @@ bool initCamera() {
    * 20-30: Medium quality
    * 30-40: Low quality (smaller file size)
    */
-  config.frame_size = FRAMESIZE_SVGA;
+  config.frame_size = resolution;
   config.jpeg_quality = 30;
   config.fb_count = 1;
   
@@ -159,6 +187,10 @@ bool captureImage() {
   if (lastImageBuffer) {
     memcpy(lastImageBuffer, fb->buf, fb->len);
     lastImageSize = fb->len;
+    
+    // Generate base64 from the image data
+    base64Image = base64::encode(fb->buf, fb->len);
+    
     newImageAvailable = true;
     Serial.println("Image stored in memory for sharing");
   } else {
@@ -196,8 +228,12 @@ void analyzeImage() {
   imageFile.read(fileBuffer, fileSize);
   imageFile.close();
   
-  String base64Image = base64::encode(fileBuffer, fileSize);
+  // Generate base64 from file data
+  base64Image = base64::encode(fileBuffer, fileSize);
   free(fileBuffer);
+  
+  // Print a short confirmation that base64 is ready
+  Serial.println("Base64 encoding completed. Length: " + String(base64Image.length()));
   
   client.setTimeout(10000);
   if (!client.connect(host, httpsPort)) {
@@ -205,27 +241,30 @@ void analyzeImage() {
     return;
   }
   
-  {
-    DynamicJsonDocument doc(40000);
-    doc["contents"][0]["parts"][0]["text"] = PROMPT;
-    doc["contents"][0]["parts"][1]["inline_data"]["mime_type"] = "image/jpeg";
-    doc["contents"][0]["parts"][1]["inline_data"]["data"] = base64Image;
-    doc["generationConfig"]["maxOutputTokens"] = 100;
-    
-    String payload;
-    serializeJson(doc, payload);
-    
-    String url = "/v1beta/models/gemini-2.0-flash-lite:generateContent?key=" + String(GEMINI_API_KEY);
-    
-    client.println("POST " + url + " HTTP/1.1");
-    client.println("Host: " + String(host));
-    client.println("Connection: close");
-    client.println("Content-Type: application/json");
-    client.print("Content-Length: ");
-    client.println(payload.length());
-    client.println();
-    client.println(payload);
-  }
+  String url = "/v1beta/models/gemini-2.0-flash-lite:generateContent?key=" + String(GEMINI_API_KEY);
+  
+  // Prepare request body
+  DynamicJsonDocument doc(40000);
+  doc["contents"][0]["parts"][0]["text"] = PROMPT;
+  doc["contents"][0]["parts"][1]["inline_data"]["mime_type"] = "image/jpeg";
+  doc["contents"][0]["parts"][1]["inline_data"]["data"] = base64Image;
+  doc["generationConfig"]["maxOutputTokens"] = 100;
+  
+  String payload;
+  serializeJson(doc, payload);
+  
+  // Print request info for diagnostics
+  Serial.println("Sending request to: " + String(host) + url);
+  Serial.println("Prompt: " + PROMPT);
+  
+  client.println("POST " + url + " HTTP/1.1");
+  client.println("Host: " + String(host));
+  client.println("Connection: close");
+  client.println("Content-Type: application/json");
+  client.print("Content-Length: ");
+  client.println(payload.length());
+  client.println();
+  client.println(payload);
   
   // Delete the image file to free space (still have it in memory)
   SD_MMC.remove(currentPhotoFilePath.c_str());
@@ -267,6 +306,10 @@ void analyzeImage() {
     client.stop();
     return;
   }
+  
+  // Print response for diagnostics
+  Serial.println("Raw API response (first 300 chars):");
+  Serial.println(response.substring(0, 300) + "...");
   
   // Extract JSON from the response
   int jsonStart = response.indexOf('{');
@@ -348,6 +391,15 @@ void handleLatestImage() {
   }
 }
 
+// API endpoint to provide base64 encoded image
+void handleGetBase64() {
+  if (base64Image.length() > 0) {
+    server.send(200, "text/plain", base64Image);
+  } else {
+    server.send(404, "text/plain", "No base64 image available");
+  }
+}
+
 // API endpoint to check if a new image is available
 void handleCheckNewImage() {
   String json = "{\"newImage\":" + String(newImageAvailable ? "true" : "false") + "}";
@@ -358,6 +410,33 @@ void handleCheckNewImage() {
 void handleResetNewImageFlag() {
   newImageAvailable = false;
   server.send(200, "text/plain", "Flag reset");
+}
+
+// Update camera resolution based on user input
+bool updateResolution(int resolutionIndex) {
+  if (resolutionIndex < 1 || resolutionIndex > 8) {
+    return false;
+  }
+  
+  // Adjust for 0-based array index
+  resolutionIndex--;
+  
+  // Only update if resolution changed
+  if (currentResolution != resolutionMap[resolutionIndex]) {
+    currentResolution = resolutionMap[resolutionIndex];
+    
+    // Reinitialize camera with new resolution
+    esp_camera_deinit();
+    if (!initCamera(currentResolution)) {
+      Serial.println("Camera reinitialization failed!");
+      return false;
+    }
+    
+    Serial.print("Resolution changed to: ");
+    Serial.println(resolutionNames[resolutionIndex]);
+  }
+  
+  return true;
 }
 
 void setup() {
@@ -393,6 +472,7 @@ void setup() {
     server.on("/", handleRoot);
     server.on("/capture", handleCapture);
     server.on("/latest", handleLatestImage);
+    server.on("/base64", handleGetBase64);  // New endpoint for base64 data
     server.on("/check", handleCheckNewImage);
     server.on("/reset", handleResetNewImageFlag);
     
@@ -403,13 +483,17 @@ void setup() {
     Serial.println("\nWiFi connection failed! Running without server.");
   }
   
-  if (!initCamera()) {
+  if (!initCamera(currentResolution)) {
     Serial.println("Camera init failed!");
     while (1) delay(1000);
   }
   
   Serial.println("All systems ready");
-  Serial.println("Press Enter to start detection");
+  Serial.println("Press Enter to capture with current resolution");
+  Serial.println("Or press 1-8 to change resolution and capture immediately:");
+  Serial.println("1: QQVGA (160x120)   2: QVGA (320x240)    3: CIF (400x296)");
+  Serial.println("4: VGA (640x480)     5: SVGA (800x600)    6: XGA (1024x768)");
+  Serial.println("7: SXGA (1280x1024)  8: UXGA (1600x1200)");
 }
 
 void loop() {
@@ -418,28 +502,83 @@ void loop() {
     server.handleClient();
   }
   
-  // Normal operation mode - wait for Enter press
+  // Check for serial input
   if (Serial.available() > 0) {
-    while (Serial.available() > 0) {
-      Serial.read();  // Clear serial buffer
+    char input = Serial.read();
+    
+    // Process numeric input for resolution change and immediately capture
+    if (input >= '1' && input <= '8') {
+      int resolutionChoice = input - '0';
+      if (updateResolution(resolutionChoice)) {
+        // Clear remaining input
+        while (Serial.available() > 0) {
+          Serial.read();
+        }
+        
+        // Proceed to capture immediately
+        // Create unique filename
+        currentPhotoFilePath = "/photo" + String(photoCounter) + ".jpg";
+        photoCounter++;
+        
+        Serial.println("--- Starting detection ---");
+        Serial.print("Using resolution: ");
+        // Find the current resolution name
+        for (int i = 0; i < 8; i++) {
+          if (resolutionMap[i] == currentResolution) {
+            Serial.println(resolutionNames[i]);
+            break;
+          }
+        }
+        
+        // Flush the camera buffer so the next capture is fresh
+        flushCameraBuffer();
+        
+        if (captureImage()) {
+          analyzeImage();
+          Serial.println("Result: " + geminiReply);
+        } else {
+          Serial.println("Capture failed");
+        }
+        
+        Serial.println("\nPress Enter to start detection with current resolution");
+        Serial.println("Or press 1-8 to change resolution and capture");
+      }
     }
-    
-    // Create unique filename
-    currentPhotoFilePath = "/photo" + String(photoCounter) + ".jpg";
-    photoCounter++;
-    
-    Serial.println("--- Starting detection ---");
-    // Flush the camera buffer so the next capture is fresh
-    flushCameraBuffer();
-    
-    if (captureImage()) {
-      analyzeImage();
-      Serial.println("Result: " + geminiReply);
-    } else {
-      Serial.println("Capture failed");
+    // Process Enter key for capture
+    else if (input == '\r' || input == '\n') {
+      // Clear remaining input
+      while (Serial.available() > 0) {
+        Serial.read();
+      }
+      
+      // Create unique filename
+      currentPhotoFilePath = "/photo" + String(photoCounter) + ".jpg";
+      photoCounter++;
+      
+      Serial.println("--- Starting detection ---");
+      Serial.print("Using resolution: ");
+      // Find the current resolution name
+      for (int i = 0; i < 8; i++) {
+        if (resolutionMap[i] == currentResolution) {
+          Serial.println(resolutionNames[i]);
+          break;
+        }
+      }
+      
+      // Flush the camera buffer so the next capture is fresh
+      flushCameraBuffer();
+      
+      if (captureImage()) {
+        analyzeImage();
+        Serial.println("Result: " + geminiReply);
+      } else {
+        Serial.println("Capture failed");
+      }
+      
+      Serial.println("\nPress Enter to start detection with current resolution");
+      Serial.println("Or press 1-8 to change resolution");
     }
-    
-    Serial.println("\nPress Enter to start detection");
+    // Ignore other characters
   }
   
   delay(10); // Small delay to prevent CPU hogging
